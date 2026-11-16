@@ -53,6 +53,13 @@ import zlib
 
 STORE = "https://apps.garmin.com"
 API = STORE + "/api/ciq-developerservices"
+# Where the store pages read an app's images, by file id, and the app's public record that names those
+# ids. The image addresses in the dashboard's own record stopped answering in November 2026 (403 to
+# every client, browsers included), so images are read here when those refuse. Measured then: the
+# cover and the screens are always served; heroes only now and then (store pages don't show them);
+# the device icons have no public copy at all.
+FILES = "https://services.garmin.com/appsLibraryExternalServices/api/"
+PUBLIC = STORE + "/api/appsLibraryExternalServices/api/asw/apps/"
 # The dashboard signs in through Garmin's single sign-on as the apps library,
 # and comes back to this address with a ticket that becomes a session cookie.
 SERVICE = STORE + "/api/auth/login?returnTo=%2Fen-US%2Fdeveloper%2Fdashboard"
@@ -95,6 +102,8 @@ class Store:
     def __init__(self):
         self.jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.public_record = None
+        self.unread = []   # images the store has but would not serve: compared as missing
         self.developer = None
 
     def request(self, method, url, data=None, headers=None, expect=(200,)):
@@ -187,12 +196,49 @@ class Store:
             raise StoreError(f"The store's list of {kind} is not a list.")
         return items
 
-    def download(self, url):
+    def public(self):
+        """The app's public record (what buyers' store pages read): {} until the app is approved."""
+        if self.public_record is None:
+            status, body, _ = self.request("GET", PUBLIC + APP_ID, headers={"Accept": "application/json"}, expect=(200, 400, 403, 404, 500))
+            try:
+                record = json.loads(body) if status == 200 and body.strip() else {}
+            except ValueError:
+                record = {}
+            self.public_record = record if isinstance(record, dict) else {}
+        return self.public_record
+
+    def public_hero(self, locale):
+        """The file id of a language's hero on the public store page, or None."""
+        wanted = str(locale).replace("-", "_").lower()
+        for model in self.public().get("appLocalizations") or []:
+            if isinstance(model, dict) and str(model.get("locale", "")).replace("-", "_").lower() == wanted:
+                return model.get("heroImageFileId")
+        return None
+
+    def public_screen(self, order):
+        ids = self.public().get("screenshotFileIds") or []
+        return ids[order] if order < len(ids) else None
+
+    def download(self, url, what=None, file_ids=(), kind="icons"):
+        """An image on the store, or None. The dashboard's address first; where it refuses, the
+        store's file service (kind: "icons" or "screenshots") under each of file_ids. The public
+        copy is the approved one: an image changed by a sync still under review compares as
+        different until Garmin approves it. An image the store has but won't serve is noted in
+        self.unread and compares as missing, so a sync sends it again."""
         if not url:
             return None
-        # 403: a new app's images aren't served until the app is approved; compare as missing
         status, body, _ = self.request("GET", urllib.parse.urljoin(STORE, url), expect=(200, 403, 404))
-        return body if status == 200 and body else None
+        if status == 200 and body:
+            return body
+        for file_id in file_ids:
+            if not is_id(file_id):
+                continue
+            status, body, _ = self.request("GET", f"{FILES}{kind}/{file_id}", expect=(200, 400, 403, 404, 500))
+            if status == 200 and body:
+                return body
+        if what:
+            self.unread.append(what)
+        return None
 
     def upload_version(self, package, version):
         """The dashboard's two calls: the package as a temporary file, then a new version made of it."""
@@ -391,7 +437,7 @@ class Plan:
             hero = language.get("hero_image", "").strip()
             if hero:
                 image = Image("hero", self.path(hero))
-                if not image.same_as(self.store.download(current.get("heroImageUrl"))):
+                if not image.same_as(self.store.download(current.get("heroImageUrl"), f"{locale} hero image", [self.store.public_hero(locale)])):
                     encoded = base64.b64encode(image.content).decode()
                     model["heroImageBase64Encoded"] = encoded
                     model["heroImageUrl"] = f"data:{image.content_type};base64,{encoded}"
@@ -424,7 +470,9 @@ class Plan:
                     raise StoreError(f"listing.toml: the store has a {slot.replace('_', ' ')}, and this sync cannot remove one. Remove it under Edit Details, or set images.{slot}.")
                 continue
             image = Image(slot, self.path(name))
-            if not image.same_as(self.store.download(coordinates.get(ICON_URLS[slot]))):
+            # only the cover has a public copy: the device icons are not on the store pages
+            public = [self.store.public().get("iconFileId")] if slot == "cover" else []
+            if not image.same_as(self.store.download(coordinates.get(ICON_URLS[slot]), slot.replace("_", " "), public)):
                 icons[slot] = image
                 self.change(slot.replace("_", " "))
         return icons
@@ -436,7 +484,8 @@ class Plan:
         coordinates = self.current.get("appFileCoordinates") or {}
         urls = coordinates.get("screenshotUrls") or []
         ids = self.current.get("screenshotIds") or []
-        live = [(screen_id, self.store.download(url)) for screen_id, url in zip(ids, urls)]
+        live = [(screen_id, self.store.download(url, f"screen {order + 1}", [screen_id, self.store.public_screen(order)], "screenshots"))
+                for order, (screen_id, url) in enumerate(zip(ids, urls))]
 
         steps = []
         for order, name in enumerate(names):
@@ -785,10 +834,16 @@ def validate(listing):
 
 
 def report(plan):
-    if plan.changes:
-        print("The store differs from git in: " + ", ".join(plan.changes) + ".")
+    # an image the store wouldn't serve is not a difference found, only a comparison that couldn't
+    # be made: it is listed apart, and a sync sends it again
+    unread = [what for what in plan.changes if what in plan.store.unread]
+    differs = [what for what in plan.changes if what not in plan.store.unread]
+    if differs:
+        print("The store differs from git in: " + ", ".join(differs) + ".")
     else:
-        print("The store matches git.")
+        print("The store matches git" + (" in everything that could be compared." if unread else "."))
+    if unread:
+        print("The store would not serve these, so a sync sends them again: " + ", ".join(unread) + ".")
 
 
 def main():
