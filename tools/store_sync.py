@@ -190,8 +190,9 @@ class Store:
     def download(self, url):
         if not url:
             return None
-        _, body, _ = self.request("GET", urllib.parse.urljoin(STORE, url), expect=(200, 404))
-        return body or None
+        # 403: a new app's images aren't served until the app is approved; compare as missing
+        status, body, _ = self.request("GET", urllib.parse.urljoin(STORE, url), expect=(200, 403, 404))
+        return body if status == 200 and body else None
 
     def upload_version(self, package, version):
         """The dashboard's two calls: the package as a temporary file, then a new version made of it."""
@@ -742,6 +743,21 @@ def validate(listing):
             image("hero", language["hero_image"], f"{loc} hero")
     if not any(is_english(loc) for loc in locales):
         problems.append("no English [[languages]] entry")
+    # A face with a Lite version: each listing links to the other app in every language
+    # (design/store/listing.toml <-> listing_lite.toml), so buyers find the free and the full version.
+    other = os.path.join(base, "listing_lite.toml" if os.path.basename(LISTING) != "listing_lite.toml" else "listing.toml")
+    if os.path.exists(other) and os.path.exists(os.path.join(base, "listing_lite.toml")):
+        with open(other, "rb") as handle:
+            other_id = tomllib.load(handle).get("store", {}).get("app_id", "")
+        if not is_id(other_id):
+            print(f"note: {os.path.basename(other)} has no app_id yet: add the link to that app "
+                  f"(https://apps.garmin.com/apps/<its id>) to every description once it exists")
+        else:
+            url = f"apps.garmin.com/apps/{other_id}"
+            for language in listing.get("languages", []):
+                if url not in language.get("description", ""):
+                    problems.append(f"{language.get('locale', '')}: the description must link to the "
+                                    f"{'Lite' if 'lite' in os.path.basename(other) else 'full'} version: https://{url}")
     images = listing.get("images", {})
     for slot in ICON_FIELDS:
         if images.get(slot):
